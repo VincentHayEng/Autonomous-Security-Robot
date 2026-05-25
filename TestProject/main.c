@@ -1,7 +1,8 @@
 #include "microchip.h"
+#include <stdio.h>
 
 void app_main() 
 {
-    microchip_init();
-    microchip_run();
+    microchip__init_gpio();
+    microchip__init_tasks();
 }
