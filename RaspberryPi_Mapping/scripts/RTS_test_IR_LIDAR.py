@@ -28,7 +28,7 @@ def read_ir(h, trig, echo):
         if time.time() > deadline: return None
     return (time.time() - start) * 171500
 
-h = lgpio.gpiochip_open(0)
+h = lgpio.gpiochip_open(4)
 for s in IR_SENSORS:
     lgpio.gpio_claim_output(h, s['trig'])
     lgpio.gpio_claim_input(h, s['echo'])
