@@ -5,41 +5,32 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
-#include "esp_wifi.h"
-#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "nvs_flash.h"
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/uart.h"
 
-#include "lwip/sockets.h"
-#include "lwip/netdb.h"
-
 // ======================================================
-// WIFI SETTINGS
+// PROJECT TAG
 // ======================================================
 
-#define WIFI_SSID       "Curvy's Z Fold5"
-#define WIFI_PASSWORD   "Zarazira2"
-
-#define UDP_PORT        5005
-#define TAG             "ROBOT_ODOM"
+#define TAG "ESP32_PI_NAV"
 
 // ======================================================
 // BTS7960 MOTOR PINS
 // ======================================================
 
-// Left motor driver
+// Left BTS7960
 #define LEFT_RPWM       GPIO_NUM_25
 #define LEFT_LPWM       GPIO_NUM_26
 #define LEFT_REN        GPIO_NUM_27
 #define LEFT_LEN        GPIO_NUM_14
 
-// Right motor driver
+// Right BTS7960
 #define RIGHT_RPWM      GPIO_NUM_32
 #define RIGHT_LPWM      GPIO_NUM_33
 #define RIGHT_REN       GPIO_NUM_18
@@ -57,9 +48,33 @@
 // ======================================================
 
 #define PI_UART_PORT       UART_NUM_2
-#define PI_UART_TX_PIN     GPIO_NUM_17
-#define PI_UART_RX_PIN     GPIO_NUM_16
+#define PI_UART_TX_PIN     GPIO_NUM_17   // ESP32 TX2 -> Raspberry Pi RX GPIO15
+#define PI_UART_RX_PIN     GPIO_NUM_16   // ESP32 RX2 <- Raspberry Pi TX GPIO14
 #define PI_UART_BAUD       115200
+
+// ======================================================
+// UART PACKET FORMAT
+// ======================================================
+//
+// Both directions use framed packets:
+//
+// 0xAA | packet type | payload length low | payload length high | payload | checksum
+//
+// ESP32 -> Pi:
+// packet type 0x01 = pose_t
+//
+// Pi -> ESP32:
+// packet type 0x02 = waypoint_t
+
+#define PKT_SYNC              0xAA
+#define PKT_TYPE_POSE         0x01
+#define PKT_TYPE_WAYPOINT     0x02
+#define UART_RX_BUF_SIZE      256
+
+// Waypoint modes from Raspberry Pi
+#define WAYPOINT_MODE_STOP    0
+#define WAYPOINT_MODE_GOTO    1
+#define WAYPOINT_MODE_RESET   2
 
 // ======================================================
 // PWM SETTINGS
@@ -78,22 +93,38 @@
 // ROBOT CALIBRATION
 // ======================================================
 
-// Your measured average from the encoder tests.
+// Measured encoder average.
 #define COUNTS_PER_REVOLUTION   518.5f
 
-// Measure your actual wheel diameter.
-// 0.072 m = 72 mm. Change this if your wheel is different.
+// Approximate Roomba wheel diameter: 72 mm.
 #define WHEEL_DIAMETER_M        0.072f
 
-// Measure centre-to-centre distance between left and right wheels.
-// Example: 235 mm. Change this to your robot.
+// Measured distance between wheel contact centres.
 #define WHEEL_BASE_MM           235.0f
 
 #define PI_VALUE                3.1415926f
 
 // ======================================================
+// NAVIGATION SETTINGS
+// ======================================================
+//
+// These values are softened to reduce oscillation.
+// Bigger tolerances mean the robot does not chase the exact millimetre.
+// Lower turn speed reduces overshoot.
+
+#define POSITION_TOLERANCE_MM       150.0f
+#define HEADING_TOLERANCE_RAD       0.60f
+#define FINAL_ANGLE_TOLERANCE_RAD   0.70f
+
+#define AUTO_DRIVE_SPEED            65
+#define AUTO_TURN_SPEED             35
+
+// ======================================================
 // POSE PACKET SENT TO RASPBERRY PI
 // ======================================================
+//
+// ESP32 sends this to the Raspberry Pi as a framed packet.
+// This is the robot's current estimated position.
 
 typedef struct __attribute__((packed))
 {
@@ -105,26 +136,61 @@ typedef struct __attribute__((packed))
 } pose_t;
 
 // ======================================================
+// WAYPOINT PACKET RECEIVED FROM RASPBERRY PI
+// ======================================================
+//
+// Raspberry Pi sends this to the ESP32 as a framed packet.
+// This tells the ESP32 where to drive next.
+
+typedef struct __attribute__((packed))
+{
+    int32_t target_x_mm;
+    int32_t target_y_mm;
+    int32_t target_theta_mrad;
+    uint8_t mode;
+    uint32_t seq;
+} waypoint_t;
+
+// ======================================================
 // GLOBAL VARIABLES
 // ======================================================
 
 volatile int32_t left_encoder_count = 0;
 volatile int32_t right_encoder_count = 0;
 
-int motor_speed = 120;
-
-// Direction is inferred from the motor command.
-//  1 = forward
-// -1 = reverse
-//  0 = stopped
+// 1 = forward, -1 = reverse, 0 = stopped.
+// These encoders are single-channel, so direction is inferred from motor command.
 volatile int left_direction = 0;
 volatile int right_direction = 0;
 
+// Current robot pose from odometry.
 float robot_x_mm = 0.0f;
 float robot_y_mm = 0.0f;
 float robot_theta_rad = 0.0f;
 
 uint32_t pose_seq = 0;
+
+// Queue used to pass received waypoints from UART RX task to navigation task.
+QueueHandle_t waypoint_queue = NULL;
+
+// ======================================================
+// ANGLE HELPER
+// ======================================================
+
+float normalize_angle_rad(float angle)
+{
+    while (angle > PI_VALUE)
+    {
+        angle = angle - 2.0f * PI_VALUE;
+    }
+
+    while (angle < -PI_VALUE)
+    {
+        angle = angle + 2.0f * PI_VALUE;
+    }
+
+    return angle;
+}
 
 // ======================================================
 // ENCODER INTERRUPTS
@@ -134,11 +200,11 @@ void IRAM_ATTR left_encoder_isr_handler(void *arg)
 {
     int32_t current_count = left_encoder_count;
 
-    if (left_direction >= 0)
+    if (left_direction > 0)
     {
         left_encoder_count = current_count + 1;
     }
-    else
+    else if (left_direction < 0)
     {
         left_encoder_count = current_count - 1;
     }
@@ -148,11 +214,11 @@ void IRAM_ATTR right_encoder_isr_handler(void *arg)
 {
     int32_t current_count = right_encoder_count;
 
-    if (right_direction >= 0)
+    if (right_direction > 0)
     {
         right_encoder_count = current_count + 1;
     }
-    else
+    else if (right_direction < 0)
     {
         right_encoder_count = current_count - 1;
     }
@@ -202,68 +268,72 @@ void stop_all()
     right_stop();
 }
 
-void left_forward()
+void left_forward_speed(int speed)
 {
-    set_pwm(LEFT_RPWM_CH, motor_speed);
+    set_pwm(LEFT_RPWM_CH, speed);
     set_pwm(LEFT_LPWM_CH, 0);
     left_direction = 1;
 }
 
-void left_reverse()
+void left_reverse_speed(int speed)
 {
     set_pwm(LEFT_RPWM_CH, 0);
-    set_pwm(LEFT_LPWM_CH, motor_speed);
+    set_pwm(LEFT_LPWM_CH, speed);
     left_direction = -1;
 }
 
-void right_forward()
+void right_forward_speed(int speed)
 {
-    set_pwm(RIGHT_RPWM_CH, motor_speed);
+    set_pwm(RIGHT_RPWM_CH, speed);
     set_pwm(RIGHT_LPWM_CH, 0);
     right_direction = 1;
 }
 
-void right_reverse()
+void right_reverse_speed(int speed)
 {
     set_pwm(RIGHT_RPWM_CH, 0);
-    set_pwm(RIGHT_LPWM_CH, motor_speed);
+    set_pwm(RIGHT_LPWM_CH, speed);
     right_direction = -1;
 }
 
-void move_forward()
+void move_forward_speed(int speed)
 {
-    left_forward();
-    right_forward();
+    left_forward_speed(speed);
+    right_forward_speed(speed);
 }
 
-void move_backward()
+void move_backward_speed(int speed)
 {
-    left_reverse();
-    right_reverse();
+    left_reverse_speed(speed);
+    right_reverse_speed(speed);
 }
 
-void turn_left()
+void turn_left_speed(int speed)
 {
-    left_reverse();
-    right_forward();
+    left_reverse_speed(speed);
+    right_forward_speed(speed);
 }
 
-void turn_right()
+void turn_right_speed(int speed)
 {
-    left_forward();
-    right_reverse();
+    left_forward_speed(speed);
+    right_reverse_speed(speed);
 }
 
-void only_left()
+void reset_pose()
 {
-    left_forward();
-    right_stop();
-}
+    stop_all();
 
-void only_right()
-{
-    left_stop();
-    right_forward();
+    left_encoder_count = 0;
+    right_encoder_count = 0;
+
+    robot_x_mm = 0.0f;
+    robot_y_mm = 0.0f;
+    robot_theta_rad = 0.0f;
+
+    pose_seq = 0;
+
+    ESP_LOGI(TAG, "Pose and encoder counts reset to x=0, y=0, theta=0");
 }
 
 // ======================================================
@@ -330,6 +400,8 @@ void setup_motors()
     stop_all();
 
     ESP_LOGI(TAG, "Motor setup complete");
+    ESP_LOGI(TAG, "Auto drive speed = %d", AUTO_DRIVE_SPEED);
+    ESP_LOGI(TAG, "Auto turn speed = %d", AUTO_TURN_SPEED);
 }
 
 // ======================================================
@@ -371,6 +443,8 @@ void setup_encoders()
     gpio_isr_handler_add(RIGHT_ENCODER_PIN, right_encoder_isr_handler, NULL);
 
     ESP_LOGI(TAG, "Encoder setup complete");
+    ESP_LOGI(TAG, "Left encoder = GPIO34");
+    ESP_LOGI(TAG, "Right encoder = GPIO35");
 }
 
 // ======================================================
@@ -389,76 +463,194 @@ void setup_pi_uart()
     uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
     uart_config.source_clk = UART_SCLK_DEFAULT;
 
-    uart_driver_install(PI_UART_PORT, 1024, 1024, 0, NULL, 0);
+    uart_driver_install(PI_UART_PORT, 2048, 2048, 0, NULL, 0);
     uart_param_config(PI_UART_PORT, &uart_config);
+
     uart_set_pin(PI_UART_PORT,
                  PI_UART_TX_PIN,
                  PI_UART_RX_PIN,
                  UART_PIN_NO_CHANGE,
                  UART_PIN_NO_CHANGE);
 
-    ESP_LOGI(TAG, "UART2 to Raspberry Pi ready: TX=GPIO17 RX=GPIO16 baud=%d", PI_UART_BAUD);
+    ESP_LOGI(TAG, "UART2 to Raspberry Pi ready");
+    ESP_LOGI(TAG, "ESP32 TX GPIO17 -> Raspberry Pi RX GPIO15");
+    ESP_LOGI(TAG, "ESP32 RX GPIO16 <- Raspberry Pi TX GPIO14");
+    ESP_LOGI(TAG, "UART baud = %d", PI_UART_BAUD);
+    ESP_LOGI(TAG, "pose_t size = %d bytes", (int)sizeof(pose_t));
+    ESP_LOGI(TAG, "waypoint_t size = %d bytes", (int)sizeof(waypoint_t));
 }
 
 // ======================================================
-// WIFI SETUP
+// SEND FRAMED POSE PACKET TO RASPBERRY PI
 // ======================================================
 
-void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                        int32_t event_id, void *event_data)
+void send_pose_packet_to_pi(pose_t *pose)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    uint8_t pkt[64];
+    uint16_t plen = sizeof(pose_t);
+    uint8_t checksum = 0;
+
+    uint8_t *payload = (uint8_t *)pose;
+
+    for (int i = 0; i < plen; i++)
     {
-        esp_wifi_connect();
+        checksum ^= payload[i];
     }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
-    {
-        ESP_LOGI(TAG, "Wi-Fi disconnected, reconnecting...");
-        esp_wifi_connect();
-    }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-    {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
-        ESP_LOGI(TAG, "ESP32 IP Address: " IPSTR, IP2STR(&event->ip_info.ip));
-    }
-}
 
-void setup_wifi()
-{
-    nvs_flash_init();
+    pkt[0] = PKT_SYNC;
+    pkt[1] = PKT_TYPE_POSE;
+    pkt[2] = plen & 0xFF;
+    pkt[3] = (plen >> 8) & 0xFF;
 
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
+    memcpy(&pkt[4], payload, plen);
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    pkt[4 + plen] = checksum;
 
-    esp_event_handler_instance_register(WIFI_EVENT,
-                                        ESP_EVENT_ANY_ID,
-                                        &wifi_event_handler,
-                                        NULL,
-                                        NULL);
-
-    esp_event_handler_instance_register(IP_EVENT,
-                                        IP_EVENT_STA_GOT_IP,
-                                        &wifi_event_handler,
-                                        NULL,
-                                        NULL);
-
-    wifi_config_t wifi_config;
-    memset(&wifi_config, 0, sizeof(wifi_config));
-
-    strcpy((char *)wifi_config.sta.ssid, WIFI_SSID);
-    strcpy((char *)wifi_config.sta.password, WIFI_PASSWORD);
-
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
+    uart_write_bytes(PI_UART_PORT, (const char *)pkt, 5 + plen);
 }
 
 // ======================================================
-// ODOMETRY + UART POSE TASK
+// WAYPOINT PACKET PARSER FROM RASPBERRY PI
+// ======================================================
+
+void process_uart_rx_bytes(uint8_t *new_data, int new_len)
+{
+    static uint8_t rx_store[UART_RX_BUF_SIZE * 2];
+    static int rx_store_len = 0;
+
+    if (new_len <= 0)
+    {
+        return;
+    }
+
+    if (rx_store_len + new_len > (int)sizeof(rx_store))
+    {
+        ESP_LOGW(TAG, "UART RX buffer overflow, clearing buffer");
+        rx_store_len = 0;
+    }
+
+    memcpy(&rx_store[rx_store_len], new_data, new_len);
+    rx_store_len = rx_store_len + new_len;
+
+    int index = 0;
+
+    while (rx_store_len - index >= 6)
+    {
+        if (rx_store[index] != PKT_SYNC)
+        {
+            index++;
+            continue;
+        }
+
+        if (rx_store[index + 1] != PKT_TYPE_WAYPOINT)
+        {
+            index++;
+            continue;
+        }
+
+        uint16_t payload_len = rx_store[index + 2] | (rx_store[index + 3] << 8);
+
+        if (payload_len != sizeof(waypoint_t))
+        {
+            ESP_LOGW(TAG,
+                     "Wrong waypoint payload length: got %d expected %d",
+                     payload_len,
+                     (int)sizeof(waypoint_t));
+
+            index++;
+            continue;
+        }
+
+        int total_packet_len = 4 + payload_len + 1;
+
+        if (rx_store_len - index < total_packet_len)
+        {
+            break;
+        }
+
+        uint8_t calculated_checksum = 0;
+
+        for (int j = 0; j < payload_len; j++)
+        {
+            calculated_checksum ^= rx_store[index + 4 + j];
+        }
+
+        uint8_t received_checksum = rx_store[index + 4 + payload_len];
+
+        if (calculated_checksum != received_checksum)
+        {
+            ESP_LOGW(TAG,
+                     "Bad waypoint checksum: calculated 0x%02X received 0x%02X",
+                     calculated_checksum,
+                     received_checksum);
+
+            index++;
+            continue;
+        }
+
+        waypoint_t wp;
+        memcpy(&wp, &rx_store[index + 4], sizeof(waypoint_t));
+
+        if (waypoint_queue != NULL)
+        {
+            xQueueOverwrite(waypoint_queue, &wp);
+        }
+
+        ESP_LOGI(TAG,
+                 "RX WAYPOINT from Pi | x=%ld mm | y=%ld mm | theta=%ld mrad | mode=%d | seq=%lu",
+                 (long)wp.target_x_mm,
+                 (long)wp.target_y_mm,
+                 (long)wp.target_theta_mrad,
+                 (int)wp.mode,
+                 (unsigned long)wp.seq);
+
+        index = index + total_packet_len;
+    }
+
+    if (index > 0)
+    {
+        int remaining = rx_store_len - index;
+
+        if (remaining > 0)
+        {
+            memmove(rx_store, &rx_store[index], remaining);
+        }
+
+        rx_store_len = remaining;
+    }
+}
+
+// ======================================================
+// UART RX TASK FROM RASPBERRY PI
+// ======================================================
+
+void pi_uart_rx_task(void *pvParameters)
+{
+    uint8_t buf[UART_RX_BUF_SIZE];
+
+    ESP_LOGI(TAG, "UART RX waypoint task started");
+    ESP_LOGI(TAG, "Waiting for framed waypoint packets from Raspberry Pi");
+
+    while (1)
+    {
+        int len = uart_read_bytes(
+            PI_UART_PORT,
+            buf,
+            UART_RX_BUF_SIZE,
+            pdMS_TO_TICKS(20)
+        );
+
+        if (len > 0)
+        {
+            process_uart_rx_bytes(buf, len);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ======================================================
+// ODOMETRY + UART TX TASK
 // ======================================================
 
 void odometry_task(void *pvParameters)
@@ -468,6 +660,12 @@ void odometry_task(void *pvParameters)
 
     float wheel_circumference_mm = PI_VALUE * WHEEL_DIAMETER_M * 1000.0f;
     float mm_per_count = wheel_circumference_mm / COUNTS_PER_REVOLUTION;
+
+    ESP_LOGI(TAG, "Odometry task started");
+    ESP_LOGI(TAG, "Counts/rev = %.2f", COUNTS_PER_REVOLUTION);
+    ESP_LOGI(TAG, "Wheel diameter = %.3f m", WHEEL_DIAMETER_M);
+    ESP_LOGI(TAG, "Wheel base = %.1f mm", WHEEL_BASE_MM);
+    ESP_LOGI(TAG, "mm per encoder count = %.4f", mm_per_count);
 
     while (1)
     {
@@ -484,154 +682,228 @@ void odometry_task(void *pvParameters)
         float d_right_mm = right_delta_count * mm_per_count;
 
         float d_center_mm = (d_left_mm + d_right_mm) / 2.0f;
-
-        // Positive theta means turning right by this convention.
         float d_theta_rad = (d_right_mm - d_left_mm) / WHEEL_BASE_MM;
 
         robot_theta_rad = robot_theta_rad + d_theta_rad;
+        robot_theta_rad = normalize_angle_rad(robot_theta_rad);
 
         robot_x_mm = robot_x_mm + d_center_mm * sinf(robot_theta_rad);
         robot_y_mm = robot_y_mm + d_center_mm * cosf(robot_theta_rad);
 
-        pose_t pose;
+        pose_t current_pose;
 
-        pose.x_mm = (int32_t)robot_x_mm;
-        pose.y_mm = (int32_t)robot_y_mm;
-        pose.theta_mrad = (int32_t)(robot_theta_rad * 1000.0f);
-        pose.timestamp_us = (uint64_t)esp_timer_get_time();
-        pose.seq = pose_seq;
+        current_pose.x_mm = (int32_t)robot_x_mm;
+        current_pose.y_mm = (int32_t)robot_y_mm;
+        current_pose.theta_mrad = (int32_t)(robot_theta_rad * 1000.0f);
+        current_pose.timestamp_us = (uint64_t)esp_timer_get_time();
+        current_pose.seq = pose_seq;
+
         pose_seq = pose_seq + 1;
 
-        uart_write_bytes(PI_UART_PORT, (const char *)&pose, sizeof(pose_t));
+        send_pose_packet_to_pi(&current_pose);
 
         ESP_LOGI(TAG,
-                 "POSE seq=%lu | x=%ld mm | y=%ld mm | theta=%ld mrad | L=%ld | R=%ld",
-                 (unsigned long)pose.seq,
-                 (long)pose.x_mm,
-                 (long)pose.y_mm,
-                 (long)pose.theta_mrad,
+                 "TX FRAMED pose_t to Pi | seq=%lu | x=%ld mm | y=%ld mm | theta=%ld mrad | L=%ld | R=%ld",
+                 (unsigned long)current_pose.seq,
+                 (long)current_pose.x_mm,
+                 (long)current_pose.y_mm,
+                 (long)current_pose.theta_mrad,
                  (long)current_left_count,
                  (long)current_right_count);
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
 // ======================================================
-// UDP KEYBOARD COMMAND TASK
+// NAVIGATION TASK
 // ======================================================
+//
+// This version adds a latched turn direction.
+// This prevents the robot from rapidly switching between left and right
+// when the heading error is close to +pi or -pi radians.
 
-void udp_server_task(void *pvParameters)
+void navigation_task(void *pvParameters)
 {
-    char receive_buffer[32];
+    waypoint_t current_waypoint;
 
-    struct sockaddr_in server_addr;
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
+    bool waypoint_active = false;
 
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    float target_x = 0.0f;
+    float target_y = 0.0f;
+    float target_theta = 0.0f;
 
-    if (sock < 0)
-    {
-        ESP_LOGE(TAG, "Could not create UDP socket");
-        vTaskDelete(NULL);
-        return;
-    }
+    int latched_turn_direction = 0;
+    // 0  = no latched turn
+    // 1  = keep turning right
+    // -1 = keep turning left
 
-    memset(&server_addr, 0, sizeof(server_addr));
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_addr.sin_port = htons(UDP_PORT);
-
-    int bind_result = bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
-
-    if (bind_result < 0)
-    {
-        ESP_LOGE(TAG, "Could not bind UDP socket");
-        close(sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "UDP server listening on port %d", UDP_PORT);
+    ESP_LOGI(TAG, "Navigation task started");
 
     while (1)
     {
-        int length = recvfrom(sock,
-                              receive_buffer,
-                              sizeof(receive_buffer) - 1,
-                              0,
-                              (struct sockaddr *)&client_addr,
-                              &client_addr_len);
+        waypoint_t new_waypoint;
 
-        if (length < 0)
+        if (waypoint_queue != NULL)
         {
-            ESP_LOGE(TAG, "UDP receive error");
-            continue;
-        }
-
-        receive_buffer[length] = '\0';
-
-        char command = receive_buffer[0];
-
-        if (command == 'w')
-        {
-            ESP_LOGI(TAG, "Command: forward");
-            move_forward();
-        }
-        else if (command == 's')
-        {
-            ESP_LOGI(TAG, "Command: backward");
-            move_backward();
-        }
-        else if (command == 'l')
-        {
-            ESP_LOGI(TAG, "Command: turn left");
-            turn_left();
-        }
-        else if (command == 'r')
-        {
-            ESP_LOGI(TAG, "Command: turn right");
-            turn_right();
-        }
-        else if (command == 'a')
-        {
-            ESP_LOGI(TAG, "Command: left motor only");
-            only_left();
-        }
-        else if (command == 'd')
-        {
-            ESP_LOGI(TAG, "Command: right motor only");
-            only_right();
-        }
-        else if (command == 'x' || command == ' ')
-        {
-            ESP_LOGI(TAG, "Command: stop");
-            stop_all();
-        }
-        else if (command == '+')
-        {
-            motor_speed = motor_speed + 20;
-
-            if (motor_speed > 255)
+            if (xQueueReceive(waypoint_queue, &new_waypoint, 0) == pdTRUE)
             {
-                motor_speed = 255;
-            }
+                current_waypoint = new_waypoint;
 
-            ESP_LOGI(TAG, "Speed increased to %d", motor_speed);
+                target_x = (float)current_waypoint.target_x_mm;
+                target_y = (float)current_waypoint.target_y_mm;
+                target_theta = ((float)current_waypoint.target_theta_mrad) / 1000.0f;
+
+                if (current_waypoint.mode == WAYPOINT_MODE_STOP)
+                {
+                    stop_all();
+                    waypoint_active = false;
+                    latched_turn_direction = 0;
+
+                    ESP_LOGI(TAG,
+                             "WAYPOINT COMMAND: STOP | seq=%lu",
+                             (unsigned long)current_waypoint.seq);
+                }
+                else if (current_waypoint.mode == WAYPOINT_MODE_RESET)
+                {
+                    reset_pose();
+                    waypoint_active = false;
+                    latched_turn_direction = 0;
+
+                    ESP_LOGI(TAG,
+                             "WAYPOINT COMMAND: RESET | seq=%lu",
+                             (unsigned long)current_waypoint.seq);
+                }
+                else if (current_waypoint.mode == WAYPOINT_MODE_GOTO)
+                {
+                    waypoint_active = true;
+                    latched_turn_direction = 0;
+
+                    ESP_LOGI(TAG,
+                             "WAYPOINT COMMAND: GOTO active | x=%.1f y=%.1f theta=%.3f rad | seq=%lu",
+                             target_x,
+                             target_y,
+                             target_theta,
+                             (unsigned long)current_waypoint.seq);
+                }
+                else
+                {
+                    ESP_LOGW(TAG,
+                             "Unknown waypoint mode: %d",
+                             (int)current_waypoint.mode);
+                }
+            }
         }
-        else if (command == '-')
+
+        if (waypoint_active == true)
         {
-            motor_speed = motor_speed - 20;
+            float current_x = robot_x_mm;
+            float current_y = robot_y_mm;
+            float current_theta = robot_theta_rad;
 
-            if (motor_speed < 0)
+            float dx = target_x - current_x;
+            float dy = target_y - current_y;
+
+            float distance_error = sqrtf((dx * dx) + (dy * dy));
+
+            // Coordinate system:
+            // x = left/right
+            // y = forward/backward
+            // theta = robot heading
+            //
+            // atan2(dx, dy) gives heading toward the target.
+            float desired_heading = atan2f(dx, dy);
+
+            float heading_error = normalize_angle_rad(desired_heading - current_theta);
+            float final_angle_error = normalize_angle_rad(target_theta - current_theta);
+
+            if (distance_error > POSITION_TOLERANCE_MM)
             {
-                motor_speed = 0;
-            }
+                if (fabsf(heading_error) > HEADING_TOLERANCE_RAD)
+                {
+                    if (latched_turn_direction == 0)
+                    {
+                        if (heading_error > 0)
+                        {
+                            latched_turn_direction = 1;
+                        }
+                        else
+                        {
+                            latched_turn_direction = -1;
+                        }
+                    }
 
-            ESP_LOGI(TAG, "Speed decreased to %d", motor_speed);
+                    if (latched_turn_direction > 0)
+                    {
+                        ESP_LOGI(TAG,
+                                 "AUTO: latched turn right | dist=%.1f mm | heading_error=%.3f rad",
+                                 distance_error,
+                                 heading_error);
+
+                        turn_right_speed(AUTO_TURN_SPEED);
+                    }
+                    else
+                    {
+                        ESP_LOGI(TAG,
+                                 "AUTO: latched turn left | dist=%.1f mm | heading_error=%.3f rad",
+                                 distance_error,
+                                 heading_error);
+
+                        turn_left_speed(AUTO_TURN_SPEED);
+                    }
+                }
+                else
+                {
+                    latched_turn_direction = 0;
+
+                    ESP_LOGI(TAG,
+                             "AUTO: drive forward | dist=%.1f mm | heading_error=%.3f rad",
+                             distance_error,
+                             heading_error);
+
+                    move_forward_speed(AUTO_DRIVE_SPEED);
+                }
+            }
+            else
+            {
+                latched_turn_direction = 0;
+
+                if (fabsf(final_angle_error) > FINAL_ANGLE_TOLERANCE_RAD)
+                {
+                    if (final_angle_error > 0)
+                    {
+                        ESP_LOGI(TAG,
+                                 "AUTO: final turn right | angle_error=%.3f rad",
+                                 final_angle_error);
+
+                        turn_right_speed(AUTO_TURN_SPEED);
+                    }
+                    else
+                    {
+                        ESP_LOGI(TAG,
+                                 "AUTO: final turn left | angle_error=%.3f rad",
+                                 final_angle_error);
+
+                        turn_left_speed(AUTO_TURN_SPEED);
+                    }
+                }
+                else
+                {
+                    stop_all();
+
+                    waypoint_active = false;
+
+                    ESP_LOGI(TAG,
+                             "WAYPOINT REACHED | seq=%lu | current x=%.1f y=%.1f theta=%.3f rad",
+                             (unsigned long)current_waypoint.seq,
+                             current_x,
+                             current_y,
+                             current_theta);
+                }
+            }
         }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -641,12 +913,22 @@ void udp_server_task(void *pvParameters)
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting robot odometry + UART pose output");
+    ESP_LOGI(TAG, "Starting ESP32 Raspberry Pi framed UART waypoint navigation");
 
     setup_motors();
     setup_encoders();
     setup_pi_uart();
-    setup_wifi();
+
+    waypoint_queue = xQueueCreate(1, sizeof(waypoint_t));
+
+    if (waypoint_queue == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create waypoint queue");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Waypoint queue created");
+    }
 
     xTaskCreate(odometry_task,
                 "odometry_task",
@@ -655,8 +937,15 @@ extern "C" void app_main(void)
                 5,
                 NULL);
 
-    xTaskCreate(udp_server_task,
-                "udp_server_task",
+    xTaskCreate(pi_uart_rx_task,
+                "pi_uart_rx_task",
+                4096,
+                NULL,
+                6,
+                NULL);
+
+    xTaskCreate(navigation_task,
+                "navigation_task",
                 4096,
                 NULL,
                 5,
